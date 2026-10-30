@@ -1,18 +1,25 @@
-/* main.c - Cine Hub, faza 1: mreza postera + kategorije + detalji.
+/* main.c - Cine Hub v0.3: mreza postera + kategorije + detalji + import JSON.
  *
- * Pokrece se kroz websrv (Homebrew Loader), NE kroz elfldr:9021 -
- * vidi README. Reprodukcija videa jos nije dodata (faza 3).
+ * Pokrece se kroz websrv (Homebrew Loader), NE kroz elfldr:9021.
+ * Reprodukcija videa jos nije dodata (faza 3).
  */
+#include <stdarg.h>
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 #include "common.h"
 #include "ui.h"
 #include "movies.h"
 #include "stb_image.h"
 
+#ifndef APP_DIR
 #define APP_DIR      "/data/homebrew/Cinema"
+#endif
+#define IMPORT_DIR   APP_DIR "/imports"
 #define JSON_LOCAL   APP_DIR "/movies.json"
+#define JSON_BACKUP  APP_DIR "/movies.json.bak"
 #define JSON_URLFILE APP_DIR "/movies_url.txt"
 
 #define COLS      6
@@ -21,25 +28,56 @@
 #define GRID_X    60
 #define GRID_Y    150
 #define MAX_DL    (12 * 1024 * 1024)
+#define MAX_JSON  (8 * 1024 * 1024)
 
-typedef enum { SCR_GRID, SCR_DETAIL } screen_t;
+#define MAX_IMP   64
+#define IMP_ROW_H 52
+#define IMP_TOP   190
+
+typedef enum { SCR_GRID, SCR_DETAIL, SCR_IMPORT } screen_t;
 
 typedef struct {
-    ui_t      ui;
-    movies_t  mv;
-    int      *vis;          /* indeksi filmova u trenutnoj kategoriji */
-    int       n_vis;
-    int       cat;
-    int       sel;          /* pozicija u vis[] */
-    int       top_row;
-    screen_t  screen;
-    int       rows_fit;
-    int       running;
-    SDL_atomic_t stop;
+    char path[256];
+    long size;
+} imp_t;
+
+typedef struct {
+    ui_t        ui;
+    movies_t    mv;
+    int         have;           /* ima ucitanih filmova */
+    int        *vis;            /* indeksi filmova u trenutnoj kategoriji */
+    int         n_vis;
+    int         cat;
+    int         sel;            /* pozicija u vis[] */
+    int         top_row;
+    screen_t    screen;
+    int         rows_fit;
+    int         running;
+    SDL_Thread *th;             /* nit za postere */
+
+    /* import */
+    imp_t       imp[MAX_IMP];
+    int         n_imp, imp_sel, imp_top, imp_rows;
+    char        msg[160];
+    uint32_t    msg_until;
+
     /* ponavljanje d-pada */
-    int       held_btn;
-    uint32_t  held_since, held_last;
+    int         held_btn;
+    uint32_t    held_since, held_last;
 } app_t;
+
+/* Zajednicka zastavica za zaustavljanje niti za postere i curl prenosa. */
+static SDL_atomic_t g_stop;
+
+static void set_msg(app_t *a, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(a->msg, sizeof a->msg, fmt, ap);
+    va_end(ap);
+    a->msg_until = SDL_GetTicks() + 6000;
+    LOG("%s", a->msg);
+}
 
 /* ---------------- HTTP ---------------- */
 
@@ -70,6 +108,13 @@ static size_t on_data(char *p, size_t sz, size_t nm, void *ud)
     return n;
 }
 
+/* Vraca != 0 da prekine prenos (curl) kad se trazi zaustavljanje. */
+static int on_progress(void *ud, curl_off_t dt, curl_off_t dn,
+                       curl_off_t ut, curl_off_t un)
+{
+    return SDL_AtomicGet(&g_stop);
+}
+
 /* 0 = ok. Pozivalac oslobadja out->d. */
 static int http_get(const char *url, membuf_t *out)
 {
@@ -84,6 +129,8 @@ static int http_get(const char *url, membuf_t *out)
     curl_easy_setopt(c, CURLOPT_TIMEOUT, 40L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_progress);
     /* Na konzoli nema pouzdanog CA bundle-a. Za postere i spisak filmova
      * se provjera certifikata gasi; nikakvi podaci o korisniku se ne salju. */
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -109,7 +156,7 @@ static char *read_file(const char *path, size_t *len)
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (n <= 0 || n > 8 * 1024 * 1024) {
+    if (n <= 0 || n > MAX_JSON) {
         fclose(f);
         return NULL;
     }
@@ -159,10 +206,10 @@ static unsigned char *scale_poster(const unsigned char *s, int sw, int sh)
 
 static int poster_thread(void *ud)
 {
-    app_t *a = ud;
+    movies_t *mv = ud;
 
-    for (int i = 0; i < a->mv.n && !SDL_AtomicGet(&a->stop); i++) {
-        movie_t *m = &a->mv.m[i];
+    for (int i = 0; i < mv->n && !SDL_AtomicGet(&g_stop); i++) {
+        movie_t *m = &mv->m[i];
         membuf_t b;
 
         if (!m->poster_url[0] || http_get(m->poster_url, &b) != 0) {
@@ -208,6 +255,15 @@ static void upload_posters(app_t *a, SDL_Renderer *r)
     }
 }
 
+static void stop_posters(app_t *a)
+{
+    SDL_AtomicSet(&g_stop, 1);
+    if (a->th)
+        SDL_WaitThread(a->th, NULL);
+    a->th = NULL;
+    SDL_AtomicSet(&g_stop, 0);
+}
+
 /* ---------------- filter ---------------- */
 
 static void rebuild_vis(app_t *a)
@@ -230,6 +286,105 @@ static void scroll_to_sel(app_t *a)
         a->top_row = row - a->rows_fit + 1;
 }
 
+/* Preuzima nm (vlasnistvo prelazi na app), pokrece postere. */
+static void install_movies(app_t *a, movies_t *nm)
+{
+    stop_posters(a);
+    movies_free(&a->mv);
+    free(a->vis);
+    a->mv  = *nm;
+    a->vis = malloc(sizeof(int) * (size_t)a->mv.n);
+    a->cat = 0;
+    a->have = a->vis != NULL;
+    if (a->have) {
+        rebuild_vis(a);
+        a->th = SDL_CreateThread(poster_thread, "posters", &a->mv);
+    }
+}
+
+/* ---------------- import ---------------- */
+
+static int has_json_ext(const char *name)
+{
+    size_t n = strlen(name);
+    return n > 5 && strcasecmp(name + n - 5, ".json") == 0;
+}
+
+static void scan_dir(app_t *a, const char *dir)
+{
+    DIR *dp = opendir(dir);
+    if (!dp)
+        return;
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL && a->n_imp < MAX_IMP) {
+        if (de->d_name[0] == '.' || !has_json_ext(de->d_name))
+            continue;
+
+        imp_t *it = &a->imp[a->n_imp];
+        struct stat st;
+        snprintf(it->path, sizeof it->path, "%s/%s", dir, de->d_name);
+        if (stat(it->path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+            continue;
+        it->size = (long)st.st_size;
+        a->n_imp++;
+    }
+    closedir(dp);
+}
+
+static void scan_imports(app_t *a)
+{
+    a->n_imp = 0;
+    a->imp_sel = 0;
+    a->imp_top = 0;
+    scan_dir(a, IMPORT_DIR);
+    for (int i = 0; i < 8; i++) {
+        char d[24];
+        snprintf(d, sizeof d, "/mnt/usb%d", i);
+        scan_dir(a, d);
+    }
+}
+
+static void do_import(app_t *a, const char *path)
+{
+    size_t len = 0;
+    char  *js  = read_file(path, &len);
+
+    if (!js) {
+        set_msg(a, "Cannot read file (empty or over 8 MB)");
+        return;
+    }
+
+    movies_t nm;
+    int      n = movies_parse(&nm, js, len);
+    if (n <= 0) {
+        free(js);
+        set_msg(a, "Invalid JSON or no movies with a title");
+        return;
+    }
+
+    /* Stari movies.json se cuva kao .bak, pa se greska moze vratiti. */
+    rename(JSON_LOCAL, JSON_BACKUP);
+    FILE *f = fopen(JSON_LOCAL, "wb");
+    int   saved = f && fwrite(js, 1, len, f) == len;
+    if (f)
+        fclose(f);
+    free(js);
+
+    install_movies(a, &nm);
+    a->screen = SCR_GRID;
+    if (saved)
+        set_msg(a, "Imported %d movies (old list kept as movies.json.bak)", n);
+    else
+        set_msg(a, "Imported %d movies but could not save to %s", n, JSON_LOCAL);
+}
+
+static void open_import(app_t *a)
+{
+    scan_imports(a);
+    a->screen = SCR_IMPORT;
+}
+
 /* ---------------- crtanje ---------------- */
 
 static void frame(ui_t *ui, int x, int y, int w, int h, int t, SDL_Color c)
@@ -240,13 +395,23 @@ static void frame(ui_t *ui, int x, int y, int w, int h, int t, SDL_Color c)
     ui_fill_rect(ui, x + w - t, y, t, h, c);
 }
 
+static void clear(ui_t *ui)
+{
+    SDL_SetRenderDrawColor(ui->r, COL_BG.r, COL_BG.g, COL_BG.b, 255);
+    SDL_RenderClear(ui->r);
+}
+
+static void draw_msg(app_t *a, int y)
+{
+    if (a->msg[0] && SDL_GetTicks() < a->msg_until)
+        ui_text(&a->ui, 60, y, 2, COL_ACCENT, "%s", a->msg);
+}
+
 static void draw_grid(app_t *a)
 {
     ui_t *ui = &a->ui;
 
-    SDL_SetRenderDrawColor(ui->r, COL_BG.r, COL_BG.g, COL_BG.b, 255);
-    SDL_RenderClear(ui->r);
-
+    clear(ui);
     ui_text(ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
     ui_text(ui, 60, 100, 2, COL_DIM, "L1/R1: category   %s   (%d/%d)",
             a->mv.cats[a->cat], a->n_vis ? a->sel + 1 : 0, a->n_vis);
@@ -284,8 +449,9 @@ static void draw_grid(app_t *a)
                 "%s", t);
     }
 
+    draw_msg(a, ui->screen_h - 84);
     ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
-            "D-pad: move   X: open   O: exit");
+            "D-pad: move   X: open   Triangle: import JSON   O: exit");
 }
 
 static void draw_detail(app_t *a)
@@ -293,8 +459,7 @@ static void draw_detail(app_t *a)
     ui_t *ui = &a->ui;
     movie_t *m = &a->mv.m[a->vis[a->sel]];
 
-    SDL_SetRenderDrawColor(ui->r, COL_BG.r, COL_BG.g, COL_BG.b, 255);
-    SDL_RenderClear(ui->r);
+    clear(ui);
 
     SDL_Rect dst = { 100, 150, POSTER_W * 2, POSTER_H * 2 };
     if (m->tex)
@@ -333,6 +498,56 @@ static void draw_detail(app_t *a)
     ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM, "O: back");
 }
 
+static void draw_import(app_t *a)
+{
+    ui_t *ui = &a->ui;
+
+    clear(ui);
+    ui_text(ui, 60, 40, 5, COL_ACCENT, "IMPORT JSON");
+    ui_text(ui, 60, 110, 2, COL_DIM, "Looking in: %s  and  /mnt/usb0..7",
+            IMPORT_DIR);
+    ui_text(ui, 60, 140, 2, COL_DIM,
+            "Replaces your current movie list (old one is kept as .bak)");
+
+    if (a->n_imp == 0) {
+        ui_text(ui, 60, IMP_TOP + 20, 3, COL_TEXT, "No .json files found");
+        ui_text(ui, 60, IMP_TOP + 80, 2, COL_DIM,
+                "Copy a .json to the USB root or to %s", IMPORT_DIR);
+    }
+
+    int last = MIN(a->n_imp, a->imp_top + a->imp_rows);
+    for (int i = a->imp_top; i < last; i++) {
+        int y = IMP_TOP + (i - a->imp_top) * IMP_ROW_H;
+        int sel = (i == a->imp_sel);
+        if (sel)
+            ui_fill_rect(ui, 50, y - 8, ui->screen_w - 100, IMP_ROW_H - 4,
+                         COL_SEL);
+        char p[100];
+        ui_ellipsize(p, sizeof p, a->imp[i].path, 90);
+        ui_text(ui, 60, y, 2, sel ? COL_TEXT : COL_DIM, "%s", p);
+        ui_text(ui, ui->screen_w - 260, y, 2, COL_DIM, "%ld KB",
+                (a->imp[i].size + 1023) / 1024);
+    }
+
+    draw_msg(a, ui->screen_h - 84);
+    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
+            "Up/Down: choose   X: import   O: back");
+}
+
+static void draw_empty(app_t *a)
+{
+    ui_t *ui = &a->ui;
+
+    clear(ui);
+    ui_text(ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
+    ui_text(ui, 60, 140, 3, COL_TEXT, "No movie list yet");
+    ui_text(ui, 60, 200, 2, COL_DIM, "Put movies.json in: %s", APP_DIR);
+    ui_text(ui, 60, 240, 2, COL_DIM, "or press Triangle to import a .json");
+    draw_msg(a, ui->screen_h - 84);
+    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
+            "Triangle: import JSON   O: exit");
+}
+
 /* ---------------- unos ---------------- */
 
 static void move_sel(app_t *a, int d)
@@ -352,8 +567,43 @@ static void change_cat(app_t *a, int d)
     rebuild_vis(a);
 }
 
+static void import_move(app_t *a, int d)
+{
+    int s = a->imp_sel + d;
+    if (s < 0 || s >= a->n_imp)
+        return;
+    a->imp_sel = s;
+    if (s < a->imp_top)
+        a->imp_top = s;
+    if (s >= a->imp_top + a->imp_rows)
+        a->imp_top = s - a->imp_rows + 1;
+}
+
 static void on_button(app_t *a, int b)
 {
+    if (a->screen == SCR_IMPORT) {
+        switch (b) {
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:   import_move(a, -1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: import_move(a, 1);  break;
+        case SDL_CONTROLLER_BUTTON_A:
+            if (a->n_imp)
+                do_import(a, a->imp[a->imp_sel].path);
+            break;
+        case SDL_CONTROLLER_BUTTON_B:
+            a->screen = SCR_GRID;
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+    if (!a->have) {
+        if (b == SDL_CONTROLLER_BUTTON_Y)
+            open_import(a);
+        else if (b == SDL_CONTROLLER_BUTTON_B)
+            a->running = 0;
+        return;
+    }
     if (a->screen == SCR_DETAIL) {
         if (b == SDL_CONTROLLER_BUTTON_B)
             a->screen = SCR_GRID;
@@ -369,6 +619,9 @@ static void on_button(app_t *a, int b)
     case SDL_CONTROLLER_BUTTON_A:
         if (a->n_vis)
             a->screen = SCR_DETAIL;
+        break;
+    case SDL_CONTROLLER_BUTTON_Y:
+        open_import(a);
         break;
     case SDL_CONTROLLER_BUTTON_B:
         a->running = 0;
@@ -432,7 +685,7 @@ int main(int argc, char **argv)
     a.running = 1;
     a.held_btn = -1;
 
-    LOG("start %s %s", APP_NAME, APP_VERSION);
+    LOG("start %s 0.3", APP_NAME);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         ERR("SDL_Init VIDEO: %s", SDL_GetError());
@@ -464,22 +717,17 @@ int main(int argc, char **argv)
     if (ui_init(&a.ui, ren, sw, sh) != 0)
         return 1;
     a.rows_fit = MAX(1, (sh - GRID_Y - 60) / CELL_H);
+    a.imp_rows = MAX(1, (sh - IMP_TOP - 120) / IMP_ROW_H);
 
     /* Prvi kadar odmah, da ekran ne ostane crn dok se spisak ucitava. */
-    SDL_SetRenderDrawColor(ren, COL_BG.r, COL_BG.g, COL_BG.b, 255);
-    SDL_RenderClear(ren);
+    clear(&a.ui);
     ui_text(&a.ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
     ui_text(&a.ui, 60, 120, 2, COL_DIM, "Loading movie list...");
     SDL_RenderPresent(ren);
 
-    int have = load_movies(&a.mv) > 0;
-    SDL_Thread *th = NULL;
-
-    if (have) {
-        a.vis = malloc(sizeof(int) * (size_t)a.mv.n);
-        rebuild_vis(&a);
-        th = SDL_CreateThread(poster_thread, "posters", &a);
-    }
+    movies_t first;
+    if (load_movies(&first) > 0)
+        install_movies(&a, &first);
 
     SDL_GameController *gc = NULL;
     for (int i = 0; i < SDL_NumJoysticks(); i++)
@@ -493,7 +741,7 @@ int main(int argc, char **argv)
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
                 a.running = 0;
-            } else if (ev.type == SDL_CONTROLLERBUTTONDOWN && have) {
+            } else if (ev.type == SDL_CONTROLLERBUTTONDOWN) {
                 int b = ev.cbutton.button;
                 on_button(&a, b);
                 if (is_dpad(b)) {
@@ -512,7 +760,7 @@ int main(int argc, char **argv)
         }
 
         /* Ponavljanje d-pada: 350 ms zadrska, pa svakih 90 ms. */
-        if (a.held_btn >= 0 && have) {
+        if (a.held_btn >= 0) {
             uint32_t now = SDL_GetTicks();
             if (now - a.held_since > 350 && now - a.held_last > 90) {
                 on_button(&a, a.held_btn);
@@ -520,29 +768,23 @@ int main(int argc, char **argv)
             }
         }
 
-        if (!have) {
-            SDL_SetRenderDrawColor(ren, COL_BG.r, COL_BG.g, COL_BG.b, 255);
-            SDL_RenderClear(ren);
-            ui_text(&a.ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
-            ui_text(&a.ui, 60, 140, 3, COL_TEXT, "movies.json not found");
-            ui_text(&a.ui, 60, 200, 2, COL_DIM, "Put it in: %s", APP_DIR);
-            ui_text(&a.ui, 60, 260, 2, COL_DIM, "O: exit");
-            if (gc && SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B))
-                a.running = 0;
-        } else {
+        if (a.have)
             upload_posters(&a, ren);
-            if (a.screen == SCR_GRID)
-                draw_grid(&a);
-            else
-                draw_detail(&a);
-        }
+
+        if (a.screen == SCR_IMPORT)
+            draw_import(&a);
+        else if (!a.have)
+            draw_empty(&a);
+        else if (a.screen == SCR_GRID)
+            draw_grid(&a);
+        else
+            draw_detail(&a);
+
         SDL_RenderPresent(ren);
         SDL_Delay(16);
     }
 
-    SDL_AtomicSet(&a.stop, 1);
-    if (th)
-        SDL_WaitThread(th, NULL);
+    stop_posters(&a);
     movies_free(&a.mv);
     free(a.vis);
     ui_shutdown(&a.ui);
