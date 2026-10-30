@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "title": "Inception",
+    "category": "علمی تخیلی",
+    "poster_url": "https://server-hi-speed-iran.info/uploads/cache/poster_thumb/uploads/jpg/5596.jpg",
+    "description": "داستان دزدی که با نفوذ به رویاها، اسرار شرکت‌ها را می‌دزدد.",
+    "video_url": "http://peer.tct.149.giftmond.ir/morteza_movie/Inception.2010.720p.x265.BluRay.Dubbed.DigiMoviez.mkv",
+    "category_en": "Sci-Fi"
+  },
+  {
+    "id": 2,
+    "title": "Interstellar",
+    "category": "ماجراجویی",
+    "poster_url": "https://server-hi-speed-iran.info/uploads/cache/poster_thumb/uploads/jpg/2709.jpg",
+    "description": "گروهی از کاوشگران برای نجات بشریت از یک کرم‌چاله عبور می‌کنند.",
+    "video_url": "http://s1.giftmond.ir/film/Interstellar.2014.IMAX.Edition.720p.x265.HEVC.Farsi.Dubbed.mkv",
+    "category_en": "Adventure"
+  }
+]
