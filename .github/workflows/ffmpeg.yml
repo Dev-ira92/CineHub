@@ -1,0 +1,111 @@
+name: Build FFmpeg for PS5
+
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_version:
+        description: "FFmpeg version"
+        default: "7.1.1"
+  push:
+    paths:
+      - scripts/build-ffmpeg.sh
+      - .github/workflows/ffmpeg.yml
+
+jobs:
+  ffmpeg:
+    runs-on: ubuntu-24.04
+    env:
+      FFMPEG_VERSION: ${{ github.event.inputs.ffmpeg_version || '7.1.1' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 lld-18 llvm-18 llvm-18-dev libclang-common-18-dev nasm make curl xz-utils
+
+      - name: Download PS5 SDK
+        run: |
+          mkdir -p $HOME/ps5-toolchain && cd $HOME/ps5-toolchain
+          curl -sSL -o sdk.zip https://github.com/ps5-payload-dev/sdk/releases/download/v0.43/ps5-payload-sdk.zip
+          curl -sSL -o pacbrew.tar.gz https://github.com/ps5-payload-dev/pacbrew-repo/releases/download/v0.40.2/ps5-payload-dev.tar.gz
+          mkdir -p sdk && unzip -q sdk.zip -d sdk
+          tar xzf pacbrew.tar.gz --strip-components=2 -C sdk/ps5-payload-sdk/
+
+      - name: Restore cached FFmpeg
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-prefix
+          key: ffmpeg-ps5-${{ env.FFMPEG_VERSION }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          export PS5_PAYLOAD_SDK=$HOME/ps5-toolchain/sdk/ps5-payload-sdk
+          export PATH="$PS5_PAYLOAD_SDK/bin:$PATH"
+          bash scripts/build-ffmpeg.sh
+
+      - name: Link probe
+        continue-on-error: true
+        run: |
+          export PS5_PAYLOAD_SDK=$HOME/ps5-toolchain/sdk/ps5-payload-sdk
+          export PATH="$PS5_PAYLOAD_SDK/bin:$PATH"
+          mkdir -p probe && cd probe
+          cat > probe.c <<'CEOF'
+          #include <stdio.h>
+          #include <libavformat/avformat.h>
+          #include <libavcodec/avcodec.h>
+          #include <libswscale/swscale.h>
+          #include <libswresample/swresample.h>
+          int main(void)
+          {
+              const AVInputFormat *mkv = av_find_input_format("matroska");
+              const AVCodec *hevc = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+              const AVCodec *h264 = avcodec_find_decoder(AV_CODEC_ID_H264);
+              const AVCodec *aac  = avcodec_find_decoder(AV_CODEC_ID_AAC);
+              const AVCodec *ac3  = avcodec_find_decoder(AV_CODEC_ID_AC3);
+              printf("avformat %u avcodec %u swscale %u swresample %u\n",
+                     avformat_version(), avcodec_version(),
+                     swscale_version(), swresample_version());
+              printf("mkv=%p hevc=%p h264=%p aac=%p ac3=%p\n", (void *)mkv,
+                     (void *)hevc, (void *)h264, (void *)aac, (void *)ac3);
+              return (mkv && hevc && h264 && aac && ac3) ? 0 : 1;
+          }
+          CEOF
+          cat > Makefile <<'MEOF'
+          include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+          .RECIPEPREFIX := >
+          .DEFAULT_GOAL := probe.elf
+          PREFIX := $(abspath ../ffmpeg-prefix)
+          CFLAGS += -O2 -I$(PREFIX)/include
+          LDADD  += -nodefaultlibs -L$(PREFIX)/lib -lavformat -lavcodec \
+                    -lswscale -lswresample -lavutil -lz -lm \
+                    -lc -lkernel_sys -lSceLibcInternal -lSceNet
+          probe.elf: probe.c
+          > $(CC) $(CFLAGS) -c -o probe.o probe.c
+          > $(CC) -o probe.elf probe.o $(LDADD)
+          MEOF
+          make 2>&1 | tee probe.log
+          echo "---- ostalo za linkanje ----"
+          grep -E "undefined (reference|symbol)" probe.log | sort -u | head -150 || true
+          ls -la probe.elf
+
+      - name: Package
+        run: |
+          ls -la ffmpeg-prefix/lib/*.a
+          tar czf ffmpeg-ps5.tar.gz -C ffmpeg-prefix include lib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-ps5
+          path: ffmpeg-ps5.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ffmpeg-logs
+          path: |
+            ffmpeg-logs
+            probe/probe.log
+          if-no-files-found: ignore
