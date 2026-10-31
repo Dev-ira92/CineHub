@@ -26,12 +26,20 @@ jobs:
       - name: Fetch header-only deps
         run: sh scripts/deps.sh
 
+      - name: Restore FFmpeg
+        uses: actions/cache/restore@v4
+        with:
+          path: ffmpeg-prefix
+          key: ffmpeg-ps5-7.1.1-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+          fail-on-cache-miss: true
+
       - name: Build
         run: |
           export PS5_PAYLOAD_SDK=$HOME/ps5-toolchain/sdk/ps5-payload-sdk
           export PATH="$PS5_PAYLOAD_SDK/bin:$PATH"
           prospero-pkg-config --exists sdl2 && echo "sdl2 ok"
-          make
+          make 2>&1 | tee build.log
+          grep -E "undefined (reference|symbol)" build.log | sort -u | head -100 || true
           readelf -d cinehub.elf | grep -i kernel
 
       - uses: actions/upload-artifact@v4
