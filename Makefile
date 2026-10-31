@@ -6,7 +6,8 @@ SRCDIR := src
 BUILD  := build
 
 SRCS := $(SRCDIR)/main.c $(SRCDIR)/movies.c $(SRCDIR)/common.c \
-        $(SRCDIR)/ui.c $(SRCDIR)/stb_impl.c
+        $(SRCDIR)/ui.c $(SRCDIR)/stb_impl.c $(SRCDIR)/shape.c \
+        $(SRCDIR)/text.c
 
 WARN        := -Wall -Wextra -Wno-unused-parameter
 BASE_CFLAGS := $(WARN) -O2 -I$(SRCDIR)
