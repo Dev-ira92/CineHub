@@ -1,9 +1,10 @@
-/* main.c - Cine Hub v0.4: mreza postera + kategorije + detalji + import JSON
- * + farsi tekst (TTF).
+/* main.c - Cine Hub v0.7: mreza postera + kategorije + detalji + import JSON
+ * + farsi tekst (TTF) + izvoz playliste (.m3u) za VLC + ugradjeni plejer
+ * (faza 1: samo video, vidi player.c).
  *
  * Pokrece se kroz websrv (Homebrew Loader), NE kroz elfldr:9021.
- * Reprodukcija videa jos nije dodata (faza 3).
  */
+#include <ctype.h>
 #include <stdarg.h>
 #include <SDL2/SDL.h>
 #include <curl/curl.h>
@@ -14,6 +15,7 @@
 #include "ui.h"
 #include "movies.h"
 #include "text.h"
+#include "player.h"
 #include "stb_image.h"
 
 #ifndef APP_DIR
@@ -24,6 +26,21 @@
 #define JSON_BACKUP  APP_DIR "/movies.json.bak"
 #define JSON_URLFILE APP_DIR "/movies_url.txt"
 #define FONT_FILE    APP_DIR "/font.ttf"
+
+/* VLC for PS5 cita biblioteku iz svog foldera media (uvijek dostupan),
+ * a iz /data/vlc i /data/media samo ako ima "full access". Playliste idu
+ * u prvi od njih koji postoji, u podfolder CineHub. */
+#ifndef VLC_APP_MEDIA
+#define VLC_APP_MEDIA "/data/homebrew/PPSA85300/media"
+#endif
+#ifndef VLC_DATA_DIR
+#define VLC_DATA_DIR  "/data/vlc"
+#endif
+#ifndef MEDIA_DIR
+#define MEDIA_DIR     "/data/media"
+#endif
+#define EXPORT_SUB    "CineHub"
+#define EXPORT_ALT    APP_DIR "/playlists"
 
 #define COLS      6
 #define CELL_W    (POSTER_W + 40)
@@ -37,7 +54,7 @@
 #define IMP_ROW_H 52
 #define IMP_TOP   190
 
-typedef enum { SCR_GRID, SCR_DETAIL, SCR_IMPORT } screen_t;
+typedef enum { SCR_GRID, SCR_DETAIL, SCR_IMPORT, SCR_PLAYER } screen_t;
 
 typedef struct {
     char path[256];
@@ -58,6 +75,7 @@ typedef struct {
     int         rows_fit;
     int         running;
     SDL_Thread *th;             /* nit za postere */
+    player_t   *pl;             /* ugradjeni plejer (SCR_PLAYER) */
 
     /* import */
     imp_t       imp[MAX_IMP];
@@ -389,6 +407,159 @@ static void open_import(app_t *a)
     a->screen = SCR_IMPORT;
 }
 
+/* ---------------- izvoz playliste za VLC ---------------- */
+
+/* Pravi ime fajla samo od ASCII slova/cifara (farsi naslovi -> movie_N). */
+static void safe_name(char *dst, size_t cap, const char *title, int idx)
+{
+    size_t o = 0;
+
+    for (const unsigned char *p = (const unsigned char *)title;
+         *p && o + 1 < cap; p++) {
+        if (isalnum(*p)) {
+            dst[o++] = (char)*p;
+        } else if ((*p == ' ' || *p == '-' || *p == '_' || *p == '.') &&
+                   o > 0 && dst[o - 1] != '_') {
+            dst[o++] = '_';
+        }
+    }
+    while (o > 0 && dst[o - 1] == '_')
+        o--;
+    dst[o] = '\0';
+    if (o == 0)
+        snprintf(dst, cap, "movie_%d", idx);
+}
+
+static int is_dir(const char *p)
+{
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+/* Trazeni folder: prvi postojeci VLC-ov folder + /CineHub, a ako nijedan ne
+ * postoji, APP_DIR/playlists (pa se fajlovi kopiraju rucno, FTP-om). */
+static const char *export_dir(char *buf, size_t cap)
+{
+    /* VLC_APP_MEDIA i /data/vlc se ne prave: nastaju kad se VLC pokrene. */
+    static const char *const roots[] = { VLC_APP_MEDIA, VLC_DATA_DIR, NULL };
+
+    for (int i = 0; roots[i]; i++) {
+        if (!is_dir(roots[i]))
+            continue;
+        snprintf(buf, cap, "%s/%s", roots[i], EXPORT_SUB);
+        mkdir(buf, 0777);
+        if (is_dir(buf))
+            return buf;
+    }
+    mkdir(MEDIA_DIR, 0777);
+    snprintf(buf, cap, "%s/%s", MEDIA_DIR, EXPORT_SUB);
+    mkdir(buf, 0777);
+    if (is_dir(buf))
+        return buf;
+
+    mkdir(EXPORT_ALT, 0777);
+    snprintf(buf, cap, "%s", EXPORT_ALT);
+    return is_dir(buf) ? buf : NULL;
+}
+
+/* Pise .m3u sa filmovima list[0..n). Vraca broj upisanih ili -1. */
+static int write_m3u(const char *path, app_t *a, const int *list, int n)
+{
+    FILE *f = fopen(path, "wb");
+    int   w = 0;
+
+    if (!f)
+        return -1;
+    fputs("#EXTM3U\n", f);
+    for (int i = 0; i < n; i++) {
+        const movie_t *m = &a->mv.m[list[i]];
+        if (!m->video_url[0])
+            continue;
+        char t[M_TITLE];
+        snprintf(t, sizeof t, "%s", m->title);
+        for (char *c = t; *c; c++)
+            if (*c == '\n' || *c == '\r')
+                *c = ' ';
+        fprintf(f, "#EXTINF:-1,%s\n%s\n", t, m->video_url);
+        w++;
+    }
+    return fclose(f) == 0 ? w : -1;
+}
+
+static void export_one(app_t *a)
+{
+    if (!a->n_vis)
+        return;
+    int   idx = a->vis[a->sel];
+    char  dir[200], name[96], path[320];
+
+    if (!a->mv.m[idx].video_url[0]) {
+        set_msg(a, "This movie has no video_url");
+        return;
+    }
+    if (!export_dir(dir, sizeof dir)) {
+        set_msg(a, "Cannot create a playlist folder");
+        return;
+    }
+    safe_name(name, sizeof name, a->mv.m[idx].title, idx + 1);
+    snprintf(path, sizeof path, "%s/%s.m3u", dir, name);
+    if (write_m3u(path, a, &idx, 1) == 1)
+        set_msg(a, "Saved %s - now open VLC > Playlists", path);
+    else
+        set_msg(a, "Could not write %s", path);
+}
+
+static void export_all(app_t *a)
+{
+    char dir[200], name[96], path[320];
+
+    if (!a->n_vis)
+        return;
+    if (!export_dir(dir, sizeof dir)) {
+        set_msg(a, "Cannot create a playlist folder");
+        return;
+    }
+    if (a->cat == 0)
+        snprintf(name, sizeof name, "_All");
+    else
+        safe_name(name, sizeof name, a->mv.cats[a->cat], a->cat);
+    snprintf(path, sizeof path, "%s/%s.m3u", dir, name);
+    int w = write_m3u(path, a, a->vis, a->n_vis);
+    if (w >= 0)
+        set_msg(a, "Saved %d movies to %s", w, path);
+    else
+        set_msg(a, "Could not write %s", path);
+}
+
+/* ---------------- plejer ---------------- */
+
+static void start_player(app_t *a)
+{
+    if (!a->n_vis)
+        return;
+    const movie_t *m = &a->mv.m[a->vis[a->sel]];
+
+    if (!m->video_url[0]) {
+        set_msg(a, "This movie has no video_url");
+        return;
+    }
+    a->pl = player_open(a->ui.r, m->video_url, m->title, a->ui.screen_w,
+                        a->ui.screen_h);
+    if (!a->pl) {
+        set_msg(a, "Cannot start the player");
+        return;
+    }
+    a->held_btn = -1;
+    a->screen = SCR_PLAYER;
+}
+
+static void stop_player(app_t *a)
+{
+    player_close(a->pl);
+    a->pl = NULL;
+    a->screen = SCR_DETAIL;
+}
+
 /* ---------------- crtanje ---------------- */
 
 static void frame(ui_t *ui, int x, int y, int w, int h, int t, SDL_Color c)
@@ -510,7 +681,7 @@ static void draw_grid(app_t *a)
 
     draw_msg(a, ui->screen_h - 84);
     ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
-            "D-pad: move   X: open   Triangle: import JSON   O: exit");
+            "D-pad: move   X: open   Square: save playlist   Triangle: import   O: exit");
 }
 
 static void draw_detail(app_t *a)
@@ -562,8 +733,10 @@ static void draw_detail(app_t *a)
     char u[96];
     ui_ellipsize(u, sizeof u, m->video_url[0] ? m->video_url : "-", 60);
     ui_text(ui, x, 780, 2, COL_DIM, "Video: %s", u);
-    ui_text(ui, x, 840, 3, COL_ACCENT, "Playback: not added yet");
-    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM, "O: back");
+    ui_text(ui, x, 840, 3, COL_ACCENT, "X: play");
+    draw_msg(a, ui->screen_h - 84);
+    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
+            "X: play   Square: save for VLC   O: back");
 }
 
 static void draw_import(app_t *a)
@@ -672,9 +845,18 @@ static void on_button(app_t *a, int b)
             a->running = 0;
         return;
     }
+    if (a->screen == SCR_PLAYER) {
+        if (player_button(a->pl, b))
+            stop_player(a);
+        return;
+    }
     if (a->screen == SCR_DETAIL) {
         if (b == SDL_CONTROLLER_BUTTON_B)
             a->screen = SCR_GRID;
+        else if (b == SDL_CONTROLLER_BUTTON_A)
+            start_player(a);
+        else if (b == SDL_CONTROLLER_BUTTON_X)
+            export_one(a);
         return;
     }
     switch (b) {
@@ -690,6 +872,9 @@ static void on_button(app_t *a, int b)
         break;
     case SDL_CONTROLLER_BUTTON_Y:
         open_import(a);
+        break;
+    case SDL_CONTROLLER_BUTTON_X:
+        export_all(a);
         break;
     case SDL_CONTROLLER_BUTTON_B:
         a->running = 0;
@@ -753,7 +938,7 @@ int main(int argc, char **argv)
     a.running = 1;
     a.held_btn = -1;
 
-    LOG("start %s 0.4", APP_NAME);
+    LOG("start %s 0.7", APP_NAME);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         ERR("SDL_Init VIDEO: %s", SDL_GetError());
@@ -842,7 +1027,10 @@ int main(int argc, char **argv)
         if (a.have)
             upload_posters(&a, ren);
 
-        if (a.screen == SCR_IMPORT)
+        if (a.screen == SCR_PLAYER) {
+            player_update(a.pl);
+            player_draw(a.pl, &a.ui);
+        } else if (a.screen == SCR_IMPORT)
             draw_import(&a);
         else if (!a.have)
             draw_empty(&a);
@@ -855,6 +1043,7 @@ int main(int argc, char **argv)
         SDL_Delay(16);
     }
 
+    player_close(a.pl);
     stop_posters(&a);
     movies_free(&a.mv);
     free(a.vis);
