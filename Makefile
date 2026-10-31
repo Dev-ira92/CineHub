@@ -7,7 +7,7 @@ BUILD  := build
 
 SRCS := $(SRCDIR)/main.c $(SRCDIR)/movies.c $(SRCDIR)/common.c \
         $(SRCDIR)/ui.c $(SRCDIR)/stb_impl.c $(SRCDIR)/shape.c \
-        $(SRCDIR)/text.c
+        $(SRCDIR)/text.c $(SRCDIR)/player.c
 
 WARN        := -Wall -Wextra -Wno-unused-parameter
 BASE_CFLAGS := $(WARN) -O2 -I$(SRCDIR)
@@ -21,14 +21,17 @@ endif
 ifdef PS5_PAYLOAD_SDK
 # Same package list as ComicReader (known to link); static libcurl
 # pulls its dependencies through these .pc files.
+# FFmpeg (staticki) se gradi workflow-om "Build FFmpeg for PS5".
+FFMPEG      ?= ffmpeg-prefix
 PS5_PKGS    := sdl2 libarchive libwebp libcurl libxml-2.0
-BASE_CFLAGS += -DCURL_STATICLIB
+BASE_CFLAGS += -DCURL_STATICLIB -I$(FFMPEG)/include
 PS5_CFLAGS  := $(shell $(PKG_CONFIG) --cflags $(PS5_PKGS))
 PS5_LIBS    := $(shell $(PKG_CONFIG) --libs $(PS5_PKGS))
 
 CFLAGS += $(BASE_CFLAGS) $(PS5_CFLAGS)
 # Without this the process dies with SIGSYS (see ComicReader SETUP.md).
-LDADD  += -nodefaultlibs $(PS5_LIBS) -lSDL2main -lm \
+LDADD  += -nodefaultlibs -L$(FFMPEG)/lib -lavformat -lavcodec -lswscale \
+          -lswresample -lavutil $(PS5_LIBS) -lz -lSDL2main -lm \
           -lc -lkernel_sys -lSceLibcInternal -lSceNet
 
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))
