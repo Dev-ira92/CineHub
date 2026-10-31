@@ -1,4 +1,5 @@
-/* main.c - Cine Hub v0.3: mreza postera + kategorije + detalji + import JSON.
+/* main.c - Cine Hub v0.4: mreza postera + kategorije + detalji + import JSON
+ * + farsi tekst (TTF).
  *
  * Pokrece se kroz websrv (Homebrew Loader), NE kroz elfldr:9021.
  * Reprodukcija videa jos nije dodata (faza 3).
@@ -12,6 +13,7 @@
 #include "common.h"
 #include "ui.h"
 #include "movies.h"
+#include "text.h"
 #include "stb_image.h"
 
 #ifndef APP_DIR
@@ -21,6 +23,7 @@
 #define JSON_LOCAL   APP_DIR "/movies.json"
 #define JSON_BACKUP  APP_DIR "/movies.json.bak"
 #define JSON_URLFILE APP_DIR "/movies_url.txt"
+#define FONT_FILE    APP_DIR "/font.ttf"
 
 #define COLS      6
 #define CELL_W    (POSTER_W + 40)
@@ -43,6 +46,7 @@ typedef struct {
 
 typedef struct {
     ui_t        ui;
+    text_font_t *font;          /* NULL ako nema font.ttf */
     movies_t    mv;
     int         have;           /* ima ucitanih filmova */
     int        *vis;            /* indeksi filmova u trenutnoj kategoriji */
@@ -407,14 +411,62 @@ static void draw_msg(app_t *a, int y)
         ui_text(&a->ui, 60, y, 2, COL_ACCENT, "%s", a->msg);
 }
 
+/* Naziv kategorije za prikaz: izvorni (farsi) ako ima fonta. */
+static const char *cat_display(app_t *a, int cat)
+{
+    if (cat == 0 || !a->font)
+        return a->mv.cats[cat];
+    for (int i = 0; i < a->mv.n; i++)
+        if (strcmp(a->mv.m[i].cat_label, a->mv.cats[cat]) == 0 &&
+            a->mv.m[i].category[0])
+            return a->mv.m[i].category;
+    return a->mv.cats[cat];
+}
+
+/* Skracuje UTF-8 string tako da stane u maxw piksela (rez na granici znaka). */
+static void fit_text(app_t *a, int px, char *dst, size_t cap, const char *src,
+                     int maxw)
+{
+    snprintf(dst, cap, "%s", src);
+    if (font_width(a->font, px, dst, -1) <= maxw)
+        return;
+    size_t n = strlen(dst);
+    while (n > 0) {
+        n--;
+        while (n > 0 && ((unsigned char)dst[n] & 0xC0) == 0x80)
+            n--;                          /* ne rezi usred UTF-8 znaka */
+        dst[n] = '\0';
+        char t[256];
+        snprintf(t, sizeof t, "%s...", dst);
+        if (font_width(a->font, px, t, -1) <= maxw) {
+            snprintf(dst, cap, "%s", t);
+            return;
+        }
+    }
+}
+
 static void draw_grid(app_t *a)
 {
     ui_t *ui = &a->ui;
 
     clear(ui);
     ui_text(ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
-    ui_text(ui, 60, 100, 2, COL_DIM, "L1/R1: category   %s   (%d/%d)",
-            a->mv.cats[a->cat], a->n_vis ? a->sel + 1 : 0, a->n_vis);
+    {
+        const char *cn = cat_display(a, a->cat);
+        int x1 = 60 + ui_text_width(2, "L1/R1: category   ");
+        char cnt[32];
+        snprintf(cnt, sizeof cnt, "(%d/%d)", a->n_vis ? a->sel + 1 : 0,
+                 a->n_vis);
+        ui_text(ui, 60, 100, 2, COL_DIM, "L1/R1: category   ");
+        int wname;
+        if (a->font && text_has_nonascii(cn)) {
+            wname = font_draw(a->font, x1, 94, 0, 28, COL_DIM, cn, -1);
+        } else {
+            ui_text(ui, x1, 100, 2, COL_DIM, "%s", cn);
+            wname = ui_text_width(2, cn);
+        }
+        ui_text(ui, x1 + wname + 24, 100, 2, COL_DIM, "%s", cnt);
+    }
 
     int first = a->top_row * COLS;
     int last  = MIN(a->n_vis, (a->top_row + a->rows_fit) * COLS);
@@ -443,10 +495,17 @@ static void draw_grid(app_t *a)
             frame(ui, x - 4, y - 4, POSTER_W + 8, POSTER_H + 8, 4,
                   COL_ACCENT);
 
-        char t[40];
-        ui_ellipsize(t, sizeof t, m->title, POSTER_W / 16);
-        ui_text(ui, x, y + POSTER_H + 12, 2, sel ? COL_TEXT : COL_DIM,
-                "%s", t);
+        if (a->font && text_has_nonascii(m->title)) {
+            char t[160];
+            fit_text(a, 26, t, sizeof t, m->title, POSTER_W);
+            font_draw(a->font, x, y + POSTER_H + 8, POSTER_W, 26,
+                      sel ? COL_TEXT : COL_DIM, t, -1);
+        } else {
+            char t[40];
+            ui_ellipsize(t, sizeof t, m->title, POSTER_W / 16);
+            ui_text(ui, x, y + POSTER_H + 12, 2, sel ? COL_TEXT : COL_DIM,
+                    "%s", t);
+        }
     }
 
     draw_msg(a, ui->screen_h - 84);
@@ -467,18 +526,26 @@ static void draw_detail(app_t *a)
     else
         ui_fill_rect(ui, dst.x, dst.y, dst.w, dst.h, COL_PANEL);
 
-    int x = 100 + POSTER_W * 2 + 80;
-    char t[80];
-    ui_ellipsize(t, sizeof t, m->title, (ui->screen_w - x - 60) / 32);
-    ui_text(ui, x, 160, 4, COL_TEXT, "%s", t);
-    ui_text(ui, x, 240, 2, COL_ACCENT, "%s", m->cat_label);
+    int x  = 100 + POSTER_W * 2 + 80;
+    int bw = ui->screen_w - x - 60;
+    char t[160];
 
-    /* Font je 8x8 ASCII; farsi opis dolazi u fazi 2 (TTF + oblikovanje). */
-    int ascii = 1;
-    for (const char *s = m->desc; *s; s++)
-        if ((unsigned char)*s >= 128)
-            ascii = 0;
-    if (m->desc[0] && ascii) {
+    if (a->font && text_has_nonascii(m->title)) {
+        fit_text(a, 54, t, sizeof t, m->title, bw);
+        font_draw(a->font, x, 150, bw, 54, COL_TEXT, t, -1);
+    } else {
+        ui_ellipsize(t, sizeof t, m->title, bw / 32);
+        ui_text(ui, x, 160, 4, COL_TEXT, "%s", t);
+    }
+
+    if (a->font && m->category[0] && text_has_nonascii(m->category))
+        font_draw(a->font, x, 232, bw, 32, COL_ACCENT, m->category, -1);
+    else
+        ui_text(ui, x, 240, 2, COL_ACCENT, "%s", m->cat_label);
+
+    if (m->desc[0] && a->font) {
+        font_draw_wrapped(a->font, x, 300, bw, 30, 44, 10, COL_DIM, m->desc);
+    } else if (m->desc[0] && !text_has_nonascii(m->desc)) {
         char line[96];
         int  y = 300, n = (int)strlen(m->desc), pos = 0;
         while (pos < n && y < 700) {
@@ -488,7 +555,8 @@ static void draw_detail(app_t *a)
             y += 28;
         }
     } else if (m->desc[0]) {
-        ui_text(ui, x, 300, 2, COL_DIM, "(description: needs Persian font)");
+        ui_text(ui, x, 300, 2, COL_DIM, "(description: put font.ttf in %s)",
+                APP_DIR);
     }
 
     char u[96];
@@ -685,7 +753,7 @@ int main(int argc, char **argv)
     a.running = 1;
     a.held_btn = -1;
 
-    LOG("start %s 0.3", APP_NAME);
+    LOG("start %s 0.4", APP_NAME);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         ERR("SDL_Init VIDEO: %s", SDL_GetError());
@@ -716,6 +784,9 @@ int main(int argc, char **argv)
     SDL_GetRendererOutputSize(ren, &sw, &sh);
     if (ui_init(&a.ui, ren, sw, sh) != 0)
         return 1;
+    a.font = font_open(ren, FONT_FILE);
+    if (!a.font)
+        LOG("nema fonta %s - farsi tekst ce biti '?'", FONT_FILE);
     a.rows_fit = MAX(1, (sh - GRID_Y - 60) / CELL_H);
     a.imp_rows = MAX(1, (sh - IMP_TOP - 120) / IMP_ROW_H);
 
@@ -787,6 +858,7 @@ int main(int argc, char **argv)
     stop_posters(&a);
     movies_free(&a.mv);
     free(a.vis);
+    font_close(a.font);
     ui_shutdown(&a.ui);
     if (gc)
         SDL_GameControllerClose(gc);
