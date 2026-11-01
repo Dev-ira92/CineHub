@@ -23,6 +23,15 @@ jobs:
           mkdir -p sdk && unzip -q sdk.zip -d sdk
           tar xzf pacbrew.tar.gz --strip-components=2 -C sdk/ps5-payload-sdk/
 
+      - name: Remove the SDK's own FFmpeg (we link our build)
+        run: |
+          export PS5_PAYLOAD_SDK=$HOME/ps5-toolchain/sdk/ps5-payload-sdk
+          echo "--- FFmpeg files shipped with the SDK (removing):"
+          find "$PS5_PAYLOAD_SDK" \( -name 'libavcodec*' -o -name 'libavformat*' -o -name 'libavutil*' -o -name 'libswscale*' -o -name 'libswresample*' -o -name 'libavfilter*' -o -name 'libavdevice*' -o -name 'libpostproc*' \) | tee /tmp/ff-removed.txt
+          xargs -r rm -rf < /tmp/ff-removed.txt
+          echo "--- left after removal (must be empty):"
+          find "$PS5_PAYLOAD_SDK" \( -name 'libavcodec*' -o -name 'libavformat*' -o -name 'libavutil*' -o -name 'libswscale*' -o -name 'libswresample*' \) | head
+
       - name: Fetch header-only deps
         run: sh scripts/deps.sh
 
