@@ -1,4 +1,9 @@
-/* player.c - ugradjeni plejer, faza 1 (vidi player.h). */
+/* player.c - ugradjeni plejer, faza 2: video + zvuk (vidi player.h).
+ *
+ * Zvuk: FFmpeg dekodira, libswresample pretvara u 48 kHz 16-bit stereo,
+ * a nit za izlaz ga salje u sceAudioOut. Sat zvuka je glavni sat: slike se
+ * prikazuju prema njemu, a kad kasne, preskacu se. Ako zvuka nema ili izlaz
+ * ne radi, koristi se zid-sat kao u fazi 1. */
 #include <errno.h>
 #include <stdarg.h>
 #include <curl/curl.h>
@@ -7,6 +12,11 @@
 #include <libavutil/log.h>
 #include <libavutil/mem.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/dict.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
 
 #include "player.h"
 #include "common.h"
@@ -22,7 +32,55 @@
 #define FQ_N         6            /* slika (RGBA) u redu */
 #define START_FRAMES 3            /* toliko slika prije starta sata */
 
+#define A_RATE       48000
+#define A_RING_FR    (A_RATE)     /* 1 s zvuka u prstenu */
+#define A_START_FR   (A_RATE / 5) /* 0.2 s zvuka prije starta */
+#define AQ_MAX       512
+#define AQ_BYTES     (8 * 1024 * 1024)
+
 enum { ST_OPENING = 0, ST_PLAYING, ST_ENDED, ST_ERROR };
+
+/* ---------------------------------------------------------- audio izlaz
+ * sceAudioOut dolazi iz SDK-ovih stubova (-lSceAudioOut). Deklaracije su
+ * "weak" pa se program linka i bez biblioteke; tada zvuka jednostavno nema. */
+
+extern int sceAudioOutInit(void) __attribute__((weak));
+extern int sceAudioOutOpen(int32_t user, int32_t type, int32_t index,
+                           uint32_t len, uint32_t freq, uint32_t param)
+    __attribute__((weak));
+extern int sceAudioOutOutput(int32_t handle, const void *buf)
+    __attribute__((weak));
+
+static int  g_ao_port = -2;          /* -2 = jos nije pokusano */
+static int  g_ao_grain;
+static char g_ao_err[100];
+
+/* Port se otvara jednom za cijeli proces i koristi se za sve filmove. */
+static int ao_open_once(void)
+{
+    static const uint32_t grains[] = { 1024, 256 };
+
+    if (g_ao_port != -2)
+        return g_ao_port;
+    if (!sceAudioOutInit || !sceAudioOutOpen || !sceAudioOutOutput) {
+        snprintf(g_ao_err, sizeof g_ao_err, "audio library not linked");
+        return g_ao_port = -1;
+    }
+    sceAudioOutInit();
+    int h = -1;
+    for (size_t i = 0; i < sizeof grains / sizeof *grains; i++) {
+        /* korisnik 0xff = sistem, glavni port, 16-bit stereo (kao VLC-PS5) */
+        h = sceAudioOutOpen(0xff, 0, 0, grains[i], A_RATE, 1);
+        if (h >= 0) {
+            g_ao_grain = (int)grains[i];
+            LOG("audio out: port %#x, grain %d", h, g_ao_grain);
+            return g_ao_port = h;
+        }
+    }
+    snprintf(g_ao_err, sizeof g_ao_err, "sceAudioOutOpen failed (%#x)",
+             (unsigned)h);
+    return g_ao_port = -1;
+}
 
 /* ---------------------------------------------------------------- HTTP */
 
@@ -223,6 +281,12 @@ static int64_t hs_seek(void *opaque, int64_t off, int whence)
 
 /* -------------------------------------------------------------- plejer */
 
+typedef struct {
+    AVPacket **pk;
+    int        cap, head, count;
+    int64_t    bytes, max_bytes;
+} pqueue_t;
+
 struct player {
     SDL_Renderer *r;
     int           disp_w, disp_h;
@@ -246,12 +310,33 @@ struct player {
 
     SDL_Thread *th_demux, *th_dec;
 
-    SDL_mutex *pq_m;
+    SDL_mutex *pq_m;                 /* jedan lokot za oba reda paketa */
     SDL_cond  *pq_cv;
-    AVPacket  *pq[PQ_MAX];
-    int        pq_head, pq_count;
-    int64_t    pq_bytes;
+    pqueue_t   vq, aq;
     int        demux_eof;
+
+    /* zvuk */
+    int              astream;        /* -1 = nema */
+    volatile int     audio_off;      /* iskljucen (nema izlaza, greska...) */
+    char             audio_note[100];
+    char             a_codec[24];
+    AVCodecContext  *adec;
+    AVRational       atb;
+    struct SwrContext *swr;
+    char             a_info[64];
+    SDL_Thread      *th_adec, *th_aout;
+    SDL_mutex       *ar_m;           /* prsten PCM-a */
+    SDL_cond        *ar_cv;
+    int16_t         *ring;           /* A_RING_FR stereo okvira */
+    int              ar_rd, ar_wr, ar_fill;
+    double           ar_rd_pts, ar_wr_pts;
+    int              a_have_first, a_started, a_done;
+    double           a_lat;
+    SDL_atomic_t     a_pause;
+    int              underruns;
+    double           av_diff;        /* video - zvuk, s (EMA) */
+    SDL_atomic_t     behind;         /* video kasni: dekoder preskace B-slike */
+    double           late_ema;       /* koliko slike kasne iza zvuka, s */
 
     SDL_mutex *fq_m;
     SDL_cond  *fq_cv;
@@ -314,39 +399,59 @@ static int interrupted(void *opaque)
     return SDL_AtomicGet(&p->stop);
 }
 
-/* ---- red paketa ---- */
+/* ---- redovi paketa ---- */
 
-static int pq_push(player_t *p, AVPacket *pkt)
+static int pq_init(pqueue_t *q, int cap, int64_t max_bytes)
+{
+    q->pk = calloc((size_t)cap, sizeof *q->pk);
+    q->cap = cap;
+    q->max_bytes = max_bytes;
+    return q->pk ? 0 : -1;
+}
+
+static void pq_free(pqueue_t *q)
+{
+    while (q->count > 0) {
+        AVPacket *k = q->pk[q->head];
+        q->head = (q->head + 1) % q->cap;
+        q->count--;
+        av_packet_free(&k);
+    }
+    free(q->pk);
+    q->pk = NULL;
+}
+
+static int pq_push(player_t *p, pqueue_t *q, AVPacket *pkt)
 {
     SDL_LockMutex(p->pq_m);
-    while ((p->pq_count >= PQ_MAX || p->pq_bytes > PQ_BYTES) &&
+    while ((q->count >= q->cap || q->bytes > q->max_bytes) &&
            !SDL_AtomicGet(&p->stop))
         SDL_CondWaitTimeout(p->pq_cv, p->pq_m, 50);
     if (SDL_AtomicGet(&p->stop)) {
         SDL_UnlockMutex(p->pq_m);
         return -1;
     }
-    p->pq[(p->pq_head + p->pq_count) % PQ_MAX] = pkt;
-    p->pq_count++;
-    p->pq_bytes += pkt->size;
+    q->pk[(q->head + q->count) % q->cap] = pkt;
+    q->count++;
+    q->bytes += pkt->size;
     SDL_CondBroadcast(p->pq_cv);
     SDL_UnlockMutex(p->pq_m);
     return 0;
 }
 
 /* NULL = kraj toka (ili zaustavljanje). */
-static AVPacket *pq_pop(player_t *p)
+static AVPacket *pq_pop(player_t *p, pqueue_t *q)
 {
     AVPacket *pkt = NULL;
 
     SDL_LockMutex(p->pq_m);
-    while (p->pq_count == 0 && !p->demux_eof && !SDL_AtomicGet(&p->stop))
+    while (q->count == 0 && !p->demux_eof && !SDL_AtomicGet(&p->stop))
         SDL_CondWaitTimeout(p->pq_cv, p->pq_m, 50);
-    if (p->pq_count > 0 && !SDL_AtomicGet(&p->stop)) {
-        pkt = p->pq[p->pq_head];
-        p->pq_head = (p->pq_head + 1) % PQ_MAX;
-        p->pq_count--;
-        p->pq_bytes -= pkt->size;
+    if (q->count > 0 && !SDL_AtomicGet(&p->stop)) {
+        pkt = q->pk[q->head];
+        q->head = (q->head + 1) % q->cap;
+        q->count--;
+        q->bytes -= pkt->size;
         SDL_CondBroadcast(p->pq_cv);
     }
     SDL_UnlockMutex(p->pq_m);
@@ -396,7 +501,7 @@ static int dec_thread(void *ud)
         int    got = 0, rc;
 
         if (!draining) {
-            AVPacket *pkt = pq_pop(p);
+            AVPacket *pkt = pq_pop(p, &p->vq);
             t0 = now_s();                  /* ne racunaj cekanje na mrezu */
             if (!pkt) {
                 if (SDL_AtomicGet(&p->stop))
@@ -404,6 +509,12 @@ static int dec_thread(void *ud)
                 draining = 1;
                 avcodec_send_packet(p->dec, NULL);
             } else {
+                /* Ako video kasni za zvukom, preskoci nereferentne slike
+                 * (B-slike): dekod postaje bitno brzi, a sat se hvata. */
+                enum AVDiscard want = SDL_AtomicGet(&p->behind) ? AVDISCARD_NONREF
+                                                                : AVDISCARD_DEFAULT;
+                if (p->dec->skip_frame != want)
+                    p->dec->skip_frame = want;
                 rc = avcodec_send_packet(p->dec, pkt);
                 av_packet_free(&pkt);
                 if (rc < 0 && rc != AVERROR(EAGAIN)) {
@@ -505,6 +616,322 @@ done:
     return 0;
 }
 
+/* ---- zvuk ---- */
+
+/* Pise `frames` okvira u prsten (src == NULL = tisina). Blokira dok nema
+ * mjesta. Poziva se s zakljucanim ar_m; vraca 0, ili -1 pri zaustavljanju. */
+static int ring_write_locked(player_t *p, const int16_t *src, int frames)
+{
+    while (frames > 0) {
+        while (p->ar_fill >= A_RING_FR && !SDL_AtomicGet(&p->stop))
+            SDL_CondWaitTimeout(p->ar_cv, p->ar_m, 20);
+        if (SDL_AtomicGet(&p->stop))
+            return -1;
+        int n = A_RING_FR - p->ar_fill;
+        if (n > frames)
+            n = frames;
+        int first = A_RING_FR - p->ar_wr;
+        if (first > n)
+            first = n;
+        if (src) {
+            memcpy(p->ring + (size_t)p->ar_wr * 2, src, (size_t)first * 4);
+            if (n > first)
+                memcpy(p->ring, src + (size_t)first * 2, (size_t)(n - first) * 4);
+            src += (size_t)n * 2;
+        } else {
+            memset(p->ring + (size_t)p->ar_wr * 2, 0, (size_t)first * 4);
+            if (n > first)
+                memset(p->ring, 0, (size_t)(n - first) * 4);
+        }
+        p->ar_wr = (p->ar_wr + n) % A_RING_FR;
+        p->ar_fill += n;
+        p->ar_wr_pts += (double)n / A_RATE;
+        frames -= n;
+    }
+    return 0;
+}
+
+/* Dodaje dekodirani zvuk cije je prvi uzorak u trenutku pts (s). Poravnava
+ * po vremenu: rupu popuni tisinom, a zakasnjeli pocetak odbaci. */
+static void audio_push(player_t *p, const int16_t *pcm, int frames, double pts)
+{
+    SDL_LockMutex(p->ar_m);
+    if (!p->a_have_first) {
+        p->ar_rd_pts = p->ar_wr_pts = pts;
+        p->a_have_first = 1;
+    }
+    double gap = pts - p->ar_wr_pts;
+    if (gap > 2.0 || gap < -2.0) {                /* skok: kreni ispocetka */
+        p->ar_rd = p->ar_wr = p->ar_fill = 0;
+        p->ar_rd_pts = p->ar_wr_pts = pts;
+        gap = 0;
+    }
+    if (gap > 0.04) {
+        if (ring_write_locked(p, NULL, (int)(gap * A_RATE)) != 0)
+            goto out;
+    } else if (gap < -0.04) {
+        int drop = (int)(-gap * A_RATE);
+        if (drop >= frames)
+            goto out;
+        pcm += (size_t)drop * 2;
+        frames -= drop;
+    }
+    ring_write_locked(p, pcm, frames);
+out:
+    SDL_UnlockMutex(p->ar_m);
+}
+
+static int init_swr(player_t *p, const AVFrame *f, AVChannelLayout *cur_layout,
+                    int *cur_fmt, int *cur_rate)
+{
+    AVChannelLayout in, out;
+
+    if (f->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC)
+        av_channel_layout_default(&in, f->ch_layout.nb_channels);
+    else
+        av_channel_layout_copy(&in, &f->ch_layout);
+    if (p->swr && *cur_fmt == f->format && *cur_rate == f->sample_rate &&
+        av_channel_layout_compare(cur_layout, &in) == 0) {
+        av_channel_layout_uninit(&in);
+        return 0;
+    }
+    swr_free(&p->swr);
+    av_channel_layout_default(&out, 2);
+    int rc = swr_alloc_set_opts2(&p->swr, &out, AV_SAMPLE_FMT_S16, A_RATE, &in,
+                                 (enum AVSampleFormat)f->format,
+                                 f->sample_rate, 0, NULL);
+    if (rc >= 0) {
+        av_opt_set_double(p->swr, "rematrix_maxval", 1.0, 0);  /* bez klipinga */
+        rc = swr_init(p->swr);
+    }
+    av_channel_layout_uninit(&out);
+    if (rc < 0) {
+        swr_free(&p->swr);
+        av_channel_layout_uninit(&in);
+        return -1;
+    }
+    av_channel_layout_uninit(cur_layout);
+    av_channel_layout_copy(cur_layout, &in);
+    av_channel_layout_uninit(&in);
+    *cur_fmt = f->format;
+    *cur_rate = f->sample_rate;
+    snprintf(p->a_info, sizeof p->a_info, "%dch %d Hz -> stereo %d Hz",
+             f->ch_layout.nb_channels, f->sample_rate, A_RATE);
+    return 0;
+}
+
+static int adec_thread(void *ud)
+{
+    player_t *p = ud;
+    AVFrame  *f = av_frame_alloc();
+    AVChannelLayout cur = { 0 };
+    int      cur_fmt = -1, cur_rate = 0, draining = 0, cap = 0;
+    int16_t *out = NULL;
+
+    if (!f)
+        goto done;
+
+    for (;;) {
+        if (!draining) {
+            AVPacket *pkt = pq_pop(p, &p->aq);
+            if (!pkt) {
+                if (SDL_AtomicGet(&p->stop))
+                    break;
+                draining = 1;
+                avcodec_send_packet(p->adec, NULL);
+            } else if (p->audio_off) {          /* iskljucen: samo prazni red */
+                av_packet_free(&pkt);
+                continue;
+            } else {
+                int rc = avcodec_send_packet(p->adec, pkt);
+                av_packet_free(&pkt);
+                if (rc < 0 && rc != AVERROR(EAGAIN))
+                    continue;
+            }
+        }
+        while (!SDL_AtomicGet(&p->stop) && !p->audio_off &&
+               avcodec_receive_frame(p->adec, f) >= 0) {
+            if (f->nb_samples > 0 && init_swr(p, f, &cur, &cur_fmt, &cur_rate) == 0) {
+                int need = swr_get_out_samples(p->swr, f->nb_samples) + 64;
+                if (need > cap) {
+                    av_free(out);
+                    out = av_malloc((size_t)need * 4);
+                    cap = out ? need : 0;
+                }
+                if (out) {
+                    uint8_t *dst[1] = { (uint8_t *)out };
+                    int n = swr_convert(p->swr, dst, cap,
+                                        (const uint8_t *const *)f->extended_data,
+                                        f->nb_samples);
+                    int64_t ts = f->pts != AV_NOPTS_VALUE ? f->pts
+                                                          : f->best_effort_timestamp;
+                    double pts;
+                    SDL_LockMutex(p->ar_m);
+                    pts = ts != AV_NOPTS_VALUE ? ts * av_q2d(p->atb) : p->ar_wr_pts;
+                    SDL_UnlockMutex(p->ar_m);
+                    if (n > 0)
+                        audio_push(p, out, n, pts);
+                }
+            }
+            av_frame_unref(f);
+        }
+        if (draining)
+            break;
+    }
+
+done:
+    av_free(out);
+    av_channel_layout_uninit(&cur);
+    av_frame_free(&f);
+    SDL_LockMutex(p->ar_m);
+    p->a_done = 1;
+    SDL_CondBroadcast(p->ar_cv);
+    SDL_UnlockMutex(p->ar_m);
+    return 0;
+}
+
+/* Nit koja salje zvuk u sceAudioOut. sceAudioOutOutput blokira dok uredjaj
+ * ne prihvati sljedece zrno, pa ovo istovremeno daje takt satu zvuka. */
+static int aout_thread(void *ud)
+{
+    player_t *p = ud;
+    int       grain = g_ao_grain, port = g_ao_port;
+    int16_t  *buf = av_malloc((size_t)grain * 4);
+    double    t_begin = now_s();
+
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+    if (!buf) {
+        p->audio_off = 1;
+        snprintf(p->audio_note, sizeof p->audio_note, "out of memory");
+        return 0;
+    }
+
+    while (!SDL_AtomicGet(&p->stop)) {
+        SDL_LockMutex(p->ar_m);
+        if (!p->a_started) {
+            int video_ready = p->fq_count >= START_FRAMES || p->decode_done ||
+                              now_s() - t_begin > 3.0;
+            if (p->ar_fill >= A_START_FR && video_ready) {
+                p->a_started = 1;
+            } else if (p->a_done && p->ar_fill == 0) {
+                p->audio_off = 1;               /* nema zvuka: zid-sat */
+                snprintf(p->audio_note, sizeof p->audio_note,
+                         "no decodable audio");
+                SDL_UnlockMutex(p->ar_m);
+                break;
+            } else if (now_s() - t_begin > 8.0) {
+                p->audio_off = 1;
+                snprintf(p->audio_note, sizeof p->audio_note,
+                         "audio did not start in time");
+                SDL_UnlockMutex(p->ar_m);
+                break;
+            } else {
+                SDL_UnlockMutex(p->ar_m);
+                SDL_Delay(5);
+                continue;
+            }
+        }
+
+        if (SDL_AtomicGet(&p->a_pause)) {       /* pauza: tisina, sat stoji */
+            SDL_UnlockMutex(p->ar_m);
+            memset(buf, 0, (size_t)grain * 4);
+            sceAudioOutOutput(port, buf);
+            continue;
+        }
+
+        int n = p->ar_fill < grain ? p->ar_fill : grain;
+        int first = A_RING_FR - p->ar_rd;
+        if (first > n)
+            first = n;
+        memcpy(buf, p->ring + (size_t)p->ar_rd * 2, (size_t)first * 4);
+        if (n > first)
+            memcpy(buf + (size_t)first * 2, p->ring, (size_t)(n - first) * 4);
+        if (n < grain) {
+            memset(buf + (size_t)n * 2, 0, (size_t)(grain - n) * 4);
+            if (!p->a_done)
+                p->underruns++;
+        }
+        p->ar_rd = (p->ar_rd + n) % A_RING_FR;
+        p->ar_fill -= n;
+        p->ar_rd_pts += (double)grain / A_RATE;   /* sat ide u realnom vremenu */
+        if (p->ar_fill == 0)
+            p->ar_wr_pts = p->ar_rd_pts;
+        SDL_CondBroadcast(p->ar_cv);
+        SDL_UnlockMutex(p->ar_m);
+
+        sceAudioOutOutput(port, buf);
+    }
+    av_free(buf);
+    return 0;
+}
+
+/* Bira audio traku (prednost: farsi), otvara dekoder i prsten. Ako ne ide,
+ * postavlja audio_off i razlog u audio_note; video tada ide sa zid-satom. */
+static int is_persian(const AVStream *st)
+{
+    AVDictionaryEntry *e = av_dict_get(st->metadata, "language", NULL, 0);
+    return e && (!strcasecmp(e->value, "per") || !strcasecmp(e->value, "fas") ||
+                 !strcasecmp(e->value, "fa"));
+}
+
+static void audio_fail(player_t *p, const char *why)
+{
+    p->audio_off = 1;
+    p->astream = -1;
+    snprintf(p->audio_note, sizeof p->audio_note, "%s", why);
+    LOG("audio off: %s", why);
+}
+
+static void open_audio(player_t *p)
+{
+    p->astream = -1;
+    if (ao_open_once() < 0) {
+        audio_fail(p, g_ao_err);
+        return;
+    }
+    int best = -1;
+    for (unsigned i = 0; i < p->fmt->nb_streams; i++) {
+        const AVStream *st = p->fmt->streams[i];
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+            avcodec_find_decoder(st->codecpar->codec_id) && is_persian(st)) {
+            best = (int)i;
+            break;
+        }
+    }
+    const AVCodec *codec = NULL;
+    if (best < 0)
+        best = av_find_best_stream(p->fmt, AVMEDIA_TYPE_AUDIO, -1, p->vstream,
+                                   &codec, 0);
+    if (best < 0) {
+        audio_fail(p, "no audio track");
+        return;
+    }
+    const AVStream *st = p->fmt->streams[best];
+    codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        audio_fail(p, "no decoder for the audio track");
+        return;
+    }
+    p->adec = avcodec_alloc_context3(codec);
+    if (!p->adec || avcodec_parameters_to_context(p->adec, st->codecpar) < 0 ||
+        avcodec_open2(p->adec, codec, NULL) < 0) {
+        avcodec_free_context(&p->adec);
+        audio_fail(p, "cannot open the audio decoder");
+        return;
+    }
+    p->ring = av_malloc((size_t)A_RING_FR * 4);
+    if (!p->ring) {
+        avcodec_free_context(&p->adec);
+        audio_fail(p, "out of memory");
+        return;
+    }
+    p->atb = st->time_base;
+    p->astream = best;
+    p->a_lat = 1.5 * g_ao_grain / A_RATE;
+    snprintf(p->a_codec, sizeof p->a_codec, "%s", codec->name);
+    LOG("player: audio track %d (%s), grain %d", best, codec->name, g_ao_grain);
+}
+
 /* ---- demux ---- */
 
 static int demux_thread(void *ud)
@@ -579,10 +1006,18 @@ static int demux_thread(void *ud)
     p->src_h = p->dec->height;
     LOG("player: %s %dx%d, %.0f s", p->codec, p->src_w, p->src_h, p->duration);
 
+    open_audio(p);
+
     p->th_dec = SDL_CreateThread(dec_thread, "dec", p);
     if (!p->th_dec) {
         set_error(p, "cannot start the decoder thread");
         return 0;
+    }
+    if (p->astream >= 0) {
+        p->th_adec = SDL_CreateThread(adec_thread, "adec", p);
+        p->th_aout = SDL_CreateThread(aout_thread, "aout", p);
+        if (!p->th_adec || !p->th_aout)
+            p->audio_off = 1;
     }
     SDL_AtomicSet(&p->state, ST_PLAYING);
 
@@ -594,11 +1029,17 @@ static int demux_thread(void *ud)
                 fprintf(stderr, "[cine] player: read error %d\n", rc);
             break;
         }
-        if (pkt->stream_index != p->vstream) {
+        pqueue_t *q = NULL;
+        if (pkt->stream_index == p->vstream)
+            q = &p->vq;
+        else if (p->astream >= 0 && !p->audio_off &&
+                 pkt->stream_index == p->astream)
+            q = &p->aq;
+        if (!q) {
             av_packet_unref(pkt);
             continue;
         }
-        if (pq_push(p, pkt) != 0) {
+        if (pq_push(p, q, pkt) != 0) {
             av_packet_free(&pkt);
             pkt = NULL;
             break;
@@ -635,13 +1076,20 @@ player_t *player_open(SDL_Renderer *r, const char *url, const char *title,
     p->overlay = 1;
     snprintf(p->url, sizeof p->url, "%s", url);
     snprintf(p->title, sizeof p->title, "%s", title ? title : "");
+    p->astream = -1;
     p->pq_m = SDL_CreateMutex();
     p->pq_cv = SDL_CreateCond();
     p->fq_m = SDL_CreateMutex();
     p->fq_cv = SDL_CreateCond();
+    p->ar_m = SDL_CreateMutex();
+    p->ar_cv = SDL_CreateCond();
+    int ok = p->pq_m && p->pq_cv && p->fq_m && p->fq_cv && p->ar_m && p->ar_cv &&
+             pq_init(&p->vq, PQ_MAX, PQ_BYTES) == 0 &&
+             pq_init(&p->aq, AQ_MAX, AQ_BYTES) == 0;
     SDL_AtomicSet(&p->state, ST_OPENING);
-    p->th_demux = SDL_CreateThread(demux_thread, "demux", p);
-    if (!p->pq_m || !p->pq_cv || !p->fq_m || !p->fq_cv || !p->th_demux) {
+    if (ok)
+        p->th_demux = SDL_CreateThread(demux_thread, "demux", p);
+    if (!ok || !p->th_demux) {
         player_close(p);
         return NULL;
     }
@@ -657,17 +1105,22 @@ void player_close(player_t *p)
         SDL_CondBroadcast(p->pq_cv);
     if (p->fq_cv)
         SDL_CondBroadcast(p->fq_cv);
+    if (p->ar_cv)
+        SDL_CondBroadcast(p->ar_cv);
     if (p->th_demux)
-        SDL_WaitThread(p->th_demux, NULL);   /* tek tada je th_dec stabilan */
+        SDL_WaitThread(p->th_demux, NULL);   /* tek tada su th_* stabilni */
     if (p->th_dec)
         SDL_WaitThread(p->th_dec, NULL);
+    if (p->th_adec)
+        SDL_WaitThread(p->th_adec, NULL);
+    if (p->th_aout)
+        SDL_WaitThread(p->th_aout, NULL);
 
-    while (p->pq_count > 0) {
-        AVPacket *k = p->pq[p->pq_head];
-        p->pq_head = (p->pq_head + 1) % PQ_MAX;
-        p->pq_count--;
-        av_packet_free(&k);
-    }
+    pq_free(&p->vq);
+    pq_free(&p->aq);
+    swr_free(&p->swr);
+    avcodec_free_context(&p->adec);
+    av_free(p->ring);
     for (int i = 0; i < FQ_N; i++)
         av_free(p->fq[i].px);
     if (p->tex)
@@ -689,6 +1142,10 @@ void player_close(player_t *p)
         SDL_DestroyMutex(p->fq_m);
     if (p->fq_cv)
         SDL_DestroyCond(p->fq_cv);
+    if (p->ar_m)
+        SDL_DestroyMutex(p->ar_m);
+    if (p->ar_cv)
+        SDL_DestroyCond(p->ar_cv);
     free(p);
 }
 
@@ -735,19 +1192,37 @@ void player_update(player_t *p)
                 SDL_AtomicSet(&p->state, ST_ENDED);
             break;
         }
-        if (!p->clock_started) {
-            if (n < START_FRAMES && !done)
-                break;                      /* skupljamo zalihu slika */
-            p->clock_base = now - pts;
-            p->clock_started = 1;
-        }
-        double t = now - p->clock_base;
-        if (t - pts > 0.5) {                /* veliki zastoj: ne odbacuj sve */
-            p->clock_base = now - pts;
-            t = pts;
+        double t;
+        if (p->astream >= 0 && !p->audio_off) {
+            /* sat zvuka je glavni */
+            SDL_LockMutex(p->ar_m);
+            int started = p->a_started;
+            t = p->ar_rd_pts - p->a_lat;
+            SDL_UnlockMutex(p->ar_m);
+            if (!started)
+                break;                      /* zvuk jos nije krenuo */
+        } else {
+            if (!p->clock_started) {
+                if (n < START_FRAMES && !done)
+                    break;                  /* skupljamo zalihu slika */
+                p->clock_base = now - pts;
+                p->clock_started = 1;
+            }
+            t = now - p->clock_base;
+            if (t - pts > 0.5) {            /* veliki zastoj: ne odbacuj sve */
+                p->clock_base = now - pts;
+                t = pts;
+            }
         }
         if (pts > t + 0.002)
             break;                          /* jos nije vrijeme */
+        if (p->astream >= 0 && !p->audio_off) {
+            p->late_ema = p->late_ema * 0.9 + (t - pts) * 0.1;
+            if (p->late_ema > 0.25)
+                SDL_AtomicSet(&p->behind, 1);
+            else if (p->late_ema < 0.06)
+                SDL_AtomicSet(&p->behind, 0);
+        }
         if (n >= 2 && pts2 <= t) {          /* kasni: preskoci */
             fq_pop(p);
             p->dropped++;
@@ -758,6 +1233,7 @@ void player_update(player_t *p)
         fq_pop(p);
         p->shown++;
         p->last_pts = pts;
+        p->av_diff = p->av_diff * 0.9 + (pts - t) * 0.1;
         break;
     }
 
@@ -812,17 +1288,30 @@ void player_draw(player_t *p, ui_t *ui)
         int qf = p->fq_count;
         SDL_UnlockMutex(p->fq_m);
 
-        ui_fill_rect(ui, 0, 0, ui->screen_w, 150, COL_HUD);
+        ui_fill_rect(ui, 0, 0, ui->screen_w, 190, COL_HUD);
         ui_text(ui, 30, 14, 2, COL_TEXT,
                 "%s %dx%d @ %.2f   %s / %s%s", p->codec, p->src_w, p->src_h,
                 p->src_fps, a, b, p->paused ? "   [PAUSED]" : "");
         ui_text(ui, 30, 50, 2, COL_ACCENT,
-                "shown %.1f fps   decode %.1f ms   convert %.1f ms",
-                p->fps, p->dec_ms, p->conv_ms);
+                "shown %.1f fps   decode %.1f ms   convert %.1f ms%s",
+                p->fps, p->dec_ms, p->conv_ms,
+                SDL_AtomicGet(&p->behind) ? "   [CATCHING UP: skipping B-frames]" : "");
         ui_text(ui, 30, 86, 2, COL_DIM,
                 "dropped %d   frames queued %d/%d   packets %d   threads %d",
-                p->dropped, qf, FQ_N, p->pq_count, PLAYER_THREADS);
-        ui_text(ui, 30, 118, 2, COL_DIM,
+                p->dropped, qf, FQ_N, p->vq.count, PLAYER_THREADS);
+        if (p->astream >= 0 && !p->audio_off) {
+            SDL_LockMutex(p->ar_m);
+            int ring_ms = (int)(1000.0 * p->ar_fill / A_RATE);
+            SDL_UnlockMutex(p->ar_m);
+            ui_text(ui, 30, 118, 2, COL_ACCENT,
+                    "audio %s %s   a/v %+d ms   underruns %d   buffer %d ms",
+                    p->a_codec, p->a_info, (int)(p->av_diff * 1000.0),
+                    p->underruns, ring_ms);
+        } else {
+            ui_text(ui, 30, 118, 2, COL_DIM, "audio: off (%s)",
+                    p->audio_note[0] ? p->audio_note : "starting");
+        }
+        ui_text(ui, 30, 154, 2, COL_DIM,
                 "X: pause   Triangle: hide this   O: stop");
     }
 }
@@ -838,6 +1327,7 @@ int player_button(player_t *p, int button)
         if (SDL_AtomicGet(&p->state) == ST_PLAYING) {
             double now = now_s();
             p->paused = !p->paused;
+            SDL_AtomicSet(&p->a_pause, p->paused);
             if (p->paused)
                 p->pause_began = now;
             else
