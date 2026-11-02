@@ -28,11 +28,19 @@ BASE_CFLAGS += -DCURL_STATICLIB -I$(FFMPEG)/include
 PS5_CFLAGS  := $(shell $(PKG_CONFIG) --cflags $(PS5_PKGS))
 PS5_LIBS    := $(shell $(PKG_CONFIG) --libs $(PS5_PKGS))
 
+# Zvuk: stub biblioteke SceAudioOut iz SDK-a. Dodaje se samo ako ga linker
+# stvarno nadje, pa bez njega program ostaje bez zvuka umjesto da ne linka.
+AUDIO_LIB   := $(shell printf 'int main(void){return 0;}\n' > /tmp/cine_probe.c && \
+                 $(CC) /tmp/cine_probe.c -nodefaultlibs -lc -lkernel_sys \
+                 -lSceLibcInternal -lSceAudioOut -o /tmp/cine_probe.elf \
+                 >/dev/null 2>&1 && echo -lSceAudioOut)
+$(info audio library: $(if $(AUDIO_LIB),$(AUDIO_LIB),NOT FOUND - no sound))
+
 CFLAGS += $(BASE_CFLAGS) $(PS5_CFLAGS)
 # Without this the process dies with SIGSYS (see ComicReader SETUP.md).
 LDADD  += -nodefaultlibs -L$(FFMPEG)/lib -lavformat -lavcodec -lswscale \
           -lswresample -lavutil $(PS5_LIBS) -lz -lSDL2main -lm \
-          -lc -lkernel_sys -lSceLibcInternal -lSceNet
+          -lc -lkernel_sys -lSceLibcInternal -lSceNet $(AUDIO_LIB)
 
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILD)/%.o,$(SRCS))
 
