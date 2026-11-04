@@ -1,4 +1,4 @@
-/* main.c - Cine Hub v0.7: mreza postera + kategorije + detalji + import JSON
+/* main.c - Cine Hub v0.8 (tema Cinema): mreza postera + kategorije + detalji + import JSON
  * + farsi tekst (TTF) + izvoz playliste (.m3u) za VLC + ugradjeni plejer
  * (faza 1: samo video, vidi player.c).
  *
@@ -562,6 +562,8 @@ static void stop_player(app_t *a)
 
 /* ---------------- crtanje ---------------- */
 
+/* ---------------- crtanje (tema "Cinema": crno i zlatno) ---------------- */
+
 static void frame(ui_t *ui, int x, int y, int w, int h, int t, SDL_Color c)
 {
     ui_fill_rect(ui, x, y, w, t, c);
@@ -572,14 +574,29 @@ static void frame(ui_t *ui, int x, int y, int w, int h, int t, SDL_Color c)
 
 static void clear(ui_t *ui)
 {
-    SDL_SetRenderDrawColor(ui->r, COL_BG.r, COL_BG.g, COL_BG.b, 255);
-    SDL_RenderClear(ui->r);
+    ui_background(ui);
+}
+
+/* Tekst teme: TTF ako ima fonta (ljepsi), inace 8x8 bitmap. Vraca sirinu. */
+static int label(app_t *a, int x, int y, int px, SDL_Color c, const char *fmt, ...)
+{
+    char    buf[512];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (a->font)
+        return font_draw(a->font, x, y, 0, px, c, buf, -1);
+    int scale = px >= 56 ? 5 : px >= 44 ? 4 : px >= 32 ? 3 : 2;
+    ui_text(&a->ui, x, y, scale, c, "%s", buf);
+    return ui_text_width(scale, buf);
 }
 
 static void draw_msg(app_t *a, int y)
 {
     if (a->msg[0] && SDL_GetTicks() < a->msg_until)
-        ui_text(&a->ui, 60, y, 2, COL_ACCENT, "%s", a->msg);
+        label(a, 60, y, 24, COL_ACCENT, "%s", a->msg);
 }
 
 /* Naziv kategorije za prikaz: izvorni (farsi) ako ima fonta. */
@@ -616,27 +633,41 @@ static void fit_text(app_t *a, int px, char *dst, size_t cap, const char *src,
     }
 }
 
+/* Zaglavlje: filmska traka + logo "CINE HUB" (zlato i bijelo). */
+static void draw_header(app_t *a, const char *sub)
+{
+    ui_filmstrip(&a->ui, 0, 24);
+    int w = label(a, 60, 36, 64, COL_ACCENT, "CINE");
+    int x = 60 + w + 18;
+    w = label(a, x, 36, 64, COL_TEXT, "HUB");
+    if (sub)
+        label(a, x + w + 36, 58, 34, COL_DIM, "%s", sub);
+}
+
+static void draw_footer(app_t *a, const char *hint)
+{
+    ui_t *ui = &a->ui;
+
+    ui_fill_rect(ui, 60, ui->screen_h - 62, ui->screen_w - 120, 2, COL_LINE);
+    label(a, 60, ui->screen_h - 48, 24, COL_DIM, "%s", hint);
+}
+
 static void draw_grid(app_t *a)
 {
     ui_t *ui = &a->ui;
 
     clear(ui);
-    ui_text(ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
+    draw_header(a, NULL);
     {
         const char *cn = cat_display(a, a->cat);
-        int x1 = 60 + ui_text_width(2, "L1/R1: category   ");
-        char cnt[32];
-        snprintf(cnt, sizeof cnt, "(%d/%d)", a->n_vis ? a->sel + 1 : 0,
-                 a->n_vis);
-        ui_text(ui, 60, 100, 2, COL_DIM, "L1/R1: category   ");
-        int wname;
-        if (a->font && text_has_nonascii(cn)) {
-            wname = font_draw(a->font, x1, 94, 0, 28, COL_DIM, cn, -1);
-        } else {
-            ui_text(ui, x1, 100, 2, COL_DIM, "%s", cn);
-            wname = ui_text_width(2, cn);
-        }
-        ui_text(ui, x1 + wname + 24, 100, 2, COL_DIM, "%s", cnt);
+        int x = 60;
+        x += label(a, x, 114, 22, COL_DIM, "L1/R1") + 16;
+        if (a->font && text_has_nonascii(cn))
+            x += font_draw(a->font, x, 108, 0, 30, COL_ACCENT, cn, -1);
+        else
+            x += label(a, x, 108, 30, COL_ACCENT, "%s", cn);
+        label(a, x + 28, 114, 22, COL_DIM, "(%d/%d)",
+              a->n_vis ? a->sel + 1 : 0, a->n_vis);
     }
 
     int first = a->top_row * COLS;
@@ -659,17 +690,16 @@ static void draw_grid(app_t *a)
             SDL_RenderCopy(ui->r, m->tex, NULL, &dst);
         } else {
             ui_fill_rect(ui, x, y, POSTER_W, POSTER_H, COL_PANEL);
-            ui_text(ui, x + 12, y + POSTER_H / 2 - 8, 2, COL_DIM,
-                    SDL_AtomicGet(&m->pstate) == 3 ? "no poster" : "loading");
+            label(a, x + 14, y + POSTER_H / 2 - 12, 22, COL_DIM, "%s",
+                  SDL_AtomicGet(&m->pstate) == 3 ? "no poster" : "loading...");
         }
         if (sel)
-            frame(ui, x - 4, y - 4, POSTER_W + 8, POSTER_H + 8, 4,
-                  COL_ACCENT);
+            ui_glow_frame(ui, x - 4, y - 4, POSTER_W + 8, POSTER_H + 8);
 
-        if (a->font && text_has_nonascii(m->title)) {
+        if (a->font) {
             char t[160];
-            fit_text(a, 26, t, sizeof t, m->title, POSTER_W);
-            font_draw(a->font, x, y + POSTER_H + 8, POSTER_W, 26,
+            fit_text(a, 24, t, sizeof t, m->title, POSTER_W);
+            font_draw(a->font, x, y + POSTER_H + 10, POSTER_W, 24,
                       sel ? COL_TEXT : COL_DIM, t, -1);
         } else {
             char t[40];
@@ -679,9 +709,9 @@ static void draw_grid(app_t *a)
         }
     }
 
-    draw_msg(a, ui->screen_h - 84);
-    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
-            "D-pad: move   X: open   Square: save playlist   Triangle: import   O: exit");
+    draw_msg(a, ui->screen_h - 96);
+    draw_footer(a, "D-pad move     X open     Square save playlist     "
+                   "Triangle import     O exit");
 }
 
 static void draw_detail(app_t *a)
@@ -690,29 +720,32 @@ static void draw_detail(app_t *a)
     movie_t *m = &a->mv.m[a->vis[a->sel]];
 
     clear(ui);
+    draw_header(a, NULL);
 
     SDL_Rect dst = { 100, 150, POSTER_W * 2, POSTER_H * 2 };
     if (m->tex)
         SDL_RenderCopy(ui->r, m->tex, NULL, &dst);
     else
         ui_fill_rect(ui, dst.x, dst.y, dst.w, dst.h, COL_PANEL);
+    ui_glow_frame(ui, dst.x - 4, dst.y - 4, dst.w + 8, dst.h + 8);
 
     int x  = 100 + POSTER_W * 2 + 80;
     int bw = ui->screen_w - x - 60;
     char t[160];
 
-    if (a->font && text_has_nonascii(m->title)) {
+    if (a->font) {
         fit_text(a, 54, t, sizeof t, m->title, bw);
         font_draw(a->font, x, 150, bw, 54, COL_TEXT, t, -1);
     } else {
         ui_ellipsize(t, sizeof t, m->title, bw / 32);
         ui_text(ui, x, 160, 4, COL_TEXT, "%s", t);
     }
+    ui_fill_rect(ui, x, 222, 120, 4, COL_ACCENT);       /* zlatna crta */
 
     if (a->font && m->category[0] && text_has_nonascii(m->category))
-        font_draw(a->font, x, 232, bw, 32, COL_ACCENT, m->category, -1);
+        font_draw(a->font, x, 238, bw, 32, COL_ACCENT, m->category, -1);
     else
-        ui_text(ui, x, 240, 2, COL_ACCENT, "%s", m->cat_label);
+        label(a, x, 238, 30, COL_ACCENT, "%s", m->cat_label);
 
     if (m->desc[0] && a->font) {
         font_draw_wrapped(a->font, x, 300, bw, 30, 44, 10, COL_DIM, m->desc);
@@ -726,17 +759,20 @@ static void draw_detail(app_t *a)
             y += 28;
         }
     } else if (m->desc[0]) {
-        ui_text(ui, x, 300, 2, COL_DIM, "(description: put font.ttf in %s)",
-                APP_DIR);
+        label(a, x, 300, 24, COL_DIM, "(description: put font.ttf in %s)",
+              APP_DIR);
     }
 
     char u[96];
-    ui_ellipsize(u, sizeof u, m->video_url[0] ? m->video_url : "-", 60);
-    ui_text(ui, x, 780, 2, COL_DIM, "Video: %s", u);
-    ui_text(ui, x, 840, 3, COL_ACCENT, "X: play");
-    draw_msg(a, ui->screen_h - 84);
-    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
-            "X: play   Square: save for VLC   O: back");
+    ui_ellipsize(u, sizeof u, m->video_url[0] ? m->video_url : "-", 70);
+    label(a, x, 790, 22, COL_DIM, "Video: %s", u);
+
+    ui_fill_rect(ui, x, 836, 270, 66, COL_ACCENT);       /* gumb "PLAY" */
+    label(a, x + 34, 850, 34, COL_BG, "X   PLAY");
+    label(a, x + 306, 858, 24, COL_DIM, "Square: save for VLC");
+
+    draw_msg(a, ui->screen_h - 96);
+    draw_footer(a, "X play     Square save for VLC     O back");
 }
 
 static void draw_import(app_t *a)
@@ -744,35 +780,36 @@ static void draw_import(app_t *a)
     ui_t *ui = &a->ui;
 
     clear(ui);
-    ui_text(ui, 60, 40, 5, COL_ACCENT, "IMPORT JSON");
-    ui_text(ui, 60, 110, 2, COL_DIM, "Looking in: %s  and  /mnt/usb0..7",
-            IMPORT_DIR);
-    ui_text(ui, 60, 140, 2, COL_DIM,
-            "Replaces your current movie list (old one is kept as .bak)");
+    draw_header(a, "Import JSON");
+    label(a, 60, 108, 22, COL_DIM, "Looking in: %s  and  /mnt/usb0..7",
+          IMPORT_DIR);
+    label(a, 60, 140, 22, COL_DIM,
+          "Replaces your current movie list (the old one is kept as .bak)");
 
     if (a->n_imp == 0) {
-        ui_text(ui, 60, IMP_TOP + 20, 3, COL_TEXT, "No .json files found");
-        ui_text(ui, 60, IMP_TOP + 80, 2, COL_DIM,
-                "Copy a .json to the USB root or to %s", IMPORT_DIR);
+        label(a, 60, IMP_TOP + 20, 36, COL_TEXT, "No .json files found");
+        label(a, 60, IMP_TOP + 80, 24, COL_DIM,
+              "Copy a .json to the USB root or to %s", IMPORT_DIR);
     }
 
     int last = MIN(a->n_imp, a->imp_top + a->imp_rows);
     for (int i = a->imp_top; i < last; i++) {
         int y = IMP_TOP + (i - a->imp_top) * IMP_ROW_H;
         int sel = (i == a->imp_sel);
-        if (sel)
+        if (sel) {
             ui_fill_rect(ui, 50, y - 8, ui->screen_w - 100, IMP_ROW_H - 4,
                          COL_SEL);
+            ui_fill_rect(ui, 50, y - 8, 6, IMP_ROW_H - 4, COL_ACCENT);
+        }
         char p[100];
         ui_ellipsize(p, sizeof p, a->imp[i].path, 90);
-        ui_text(ui, 60, y, 2, sel ? COL_TEXT : COL_DIM, "%s", p);
-        ui_text(ui, ui->screen_w - 260, y, 2, COL_DIM, "%ld KB",
-                (a->imp[i].size + 1023) / 1024);
+        label(a, 72, y, 24, sel ? COL_TEXT : COL_DIM, "%s", p);
+        label(a, ui->screen_w - 260, y, 22, COL_DIM, "%ld KB",
+              (a->imp[i].size + 1023) / 1024);
     }
 
-    draw_msg(a, ui->screen_h - 84);
-    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
-            "Up/Down: choose   X: import   O: back");
+    draw_msg(a, ui->screen_h - 96);
+    draw_footer(a, "Up/Down choose     X import     O back");
 }
 
 static void draw_empty(app_t *a)
@@ -780,13 +817,12 @@ static void draw_empty(app_t *a)
     ui_t *ui = &a->ui;
 
     clear(ui);
-    ui_text(ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
-    ui_text(ui, 60, 140, 3, COL_TEXT, "No movie list yet");
-    ui_text(ui, 60, 200, 2, COL_DIM, "Put movies.json in: %s", APP_DIR);
-    ui_text(ui, 60, 240, 2, COL_DIM, "or press Triangle to import a .json");
-    draw_msg(a, ui->screen_h - 84);
-    ui_text(ui, 60, ui->screen_h - 44, 2, COL_DIM,
-            "Triangle: import JSON   O: exit");
+    draw_header(a, NULL);
+    label(a, 60, 150, 40, COL_TEXT, "No movie list yet");
+    label(a, 60, 215, 24, COL_DIM, "Put movies.json in: %s", APP_DIR);
+    label(a, 60, 250, 24, COL_DIM, "or press Triangle to import a .json");
+    draw_msg(a, ui->screen_h - 96);
+    draw_footer(a, "Triangle import JSON     O exit");
 }
 
 /* ---------------- unos ---------------- */
@@ -938,7 +974,7 @@ int main(int argc, char **argv)
     a.running = 1;
     a.held_btn = -1;
 
-    LOG("start %s 0.7", APP_NAME);
+    LOG("start %s 0.8", APP_NAME);
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         ERR("SDL_Init VIDEO: %s", SDL_GetError());
@@ -977,8 +1013,8 @@ int main(int argc, char **argv)
 
     /* Prvi kadar odmah, da ekran ne ostane crn dok se spisak ucitava. */
     clear(&a.ui);
-    ui_text(&a.ui, 60, 40, 5, COL_ACCENT, "CINE HUB");
-    ui_text(&a.ui, 60, 120, 2, COL_DIM, "Loading movie list...");
+    draw_header(&a, NULL);
+    label(&a, 60, 150, 26, COL_DIM, "Loading movie list...");
     SDL_RenderPresent(ren);
 
     movies_t first;
