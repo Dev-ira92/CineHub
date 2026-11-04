@@ -10,6 +10,7 @@
 typedef struct {
     SDL_Renderer *r;
     SDL_Texture  *font;   /* atlas 16x8 glifova po 8x8 piksela */
+    SDL_Texture  *bg;     /* gradijent pozadine (tema) */
     int           screen_w, screen_h;
 } ui_t;
 
@@ -21,9 +22,15 @@ extern const SDL_Color COL_TEXT;
 extern const SDL_Color COL_DIM;
 extern const SDL_Color COL_ACCENT;
 extern const SDL_Color COL_HUD;
+extern const SDL_Color COL_LINE;     /* zlatna tanka linija (providna) */
 
 int  ui_init(ui_t *ui, SDL_Renderer *r, int w, int h);
 void ui_shutdown(ui_t *ui);
+
+/* Tema "Cinema": crno i zlatno. */
+void ui_background(ui_t *ui);                       /* gradijent preko cijelog ekrana */
+void ui_filmstrip(ui_t *ui, int y, int h);          /* filmska traka s rupicama */
+void ui_glow_frame(ui_t *ui, int x, int y, int w, int h);  /* zlatni okvir sa sjajem */
 
 void ui_set_color(ui_t *ui, SDL_Color c);
 void ui_fill_rect(ui_t *ui, int x, int y, int w, int h, SDL_Color c);
